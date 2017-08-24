@@ -3,15 +3,15 @@
 package cron
 
 import (
+	"encoding/json"
+	"errors"
+	"io"
+	"io/ioutil"
 	"log"
 	"runtime"
 	"sort"
-	"time"
-	"encoding/json"
-	"errors"
 	"strconv"
-	"io"
-	"io/ioutil"
+	"time"
 )
 
 // Cron keeps track of any number of entries, invoking the associated func as
@@ -21,6 +21,7 @@ type Cron struct {
 	entries   []*Entry
 	stop      chan struct{}
 	add       chan *Entry
+	remove    chan int
 	snapshot  chan []*Entry
 	running   bool
 	ErrorLog  *log.Logger
@@ -37,15 +38,15 @@ type PresetJob struct {
 	cron       *Cron
 }
 
-func (a PresetJob)MarshalJSON() ([]byte, error) {
+func (a PresetJob) MarshalJSON() ([]byte, error) {
 	data := struct {
 		ScheduledJob string
 		Parameters   []interface{}
 		Cat          string
 	}{
 		ScheduledJob: a.JobName,
-		Parameters: a.Parameters,
-		Cat: "ArbitraryJob",
+		Parameters:   a.Parameters,
+		Cat:          "ArbitraryJob",
 	}
 	return json.Marshal(data)
 }
@@ -76,17 +77,17 @@ type Entry struct {
 
 	// The next time the job will run. This is the zero time if Cron has not been
 	// started or this entry's schedule is unsatisfiable
-	Next     time.Time
+	Next time.Time
 
 	// The last time this job was run. This is the zero time if the job has never
 	// been run.
-	Prev     time.Time
+	Prev time.Time
 
 	// The Job to run.
-	Job      Job
+	Job Job
 
-    // Allows us the lookup or categorize entries.
-	Index    string
+	// Allows us the lookup or categorize entries.
+	Index string
 }
 
 // byTime is a wrapper for sorting the entry array by time
@@ -129,13 +130,14 @@ func NewWithPresetFunctions(jobs map[string]ScheduledJob) *Cron {
 // NewWithLocation returns a new Cron job runner.
 func NewWithLocation(location *time.Location) *Cron {
 	return &Cron{
-		entries:  []*Entry{},
-		add:      make(chan *Entry),
-		stop:     make(chan struct{}),
-		snapshot: make(chan []*Entry),
-		running:  false,
-		ErrorLog: nil,
-		location: location,
+		entries:   []*Entry{},
+		add:       make(chan *Entry),
+		remove:    make(chan int, 10000),
+		stop:      make(chan struct{}),
+		snapshot:  make(chan []*Entry),
+		running:   false,
+		ErrorLog:  nil,
+		location:  location,
 		functions: map[string]ScheduledJob{},
 	}
 }
@@ -151,8 +153,8 @@ func (f FuncJob) Run() {
 // Preset jobs however requires the underlying function(presetJobName) to be registered with the Cron instance.
 func (c *Cron) NewPresetJob(presetJobName string, parameters ...interface{}) *PresetJob {
 	return &PresetJob{
-		cron: c,
-		JobName: presetJobName,
+		cron:       c,
+		JobName:    presetJobName,
 		Parameters: parameters,
 	}
 }
@@ -218,7 +220,7 @@ func (c *Cron) Schedule(schedule Schedule, cmd Job) {
 	c.add <- entry
 }
 
-// ScheduleWithIndex adds a Job to the Cron to be run on the given schedule. 
+// ScheduleWithIndex adds a Job to the Cron to be run on the given schedule.
 // It allows to key the scheduled job by index.
 func (c *Cron) ScheduleWithIndex(schedule Schedule, cmd Job, index string) {
 	entry := &Entry{
@@ -296,16 +298,28 @@ func (c *Cron) run() {
 		select {
 		case now = <-timer.C:
 			now = now.In(c.location)
-		// Run every entry whose next time was this effective time.
-			for _, e := range c.entries {
+			itemsToRemove := []int{}
+			// Run every entry whose next time was this effective time.
+			for i, e := range c.entries {
 				if e.Next != effective {
 					break
 				}
 				go c.runWithRecovery(e.Job)
+
+				// executed fixed schedules should be removed
+				if _, ok := e.Schedule.(*FixedSchedule); ok {
+					itemsToRemove = append(itemsToRemove, i)
+				}
 				e.Prev = e.Next
 				e.Next = e.Schedule.Next(now)
 			}
+			for _, i := range itemsToRemove {
+				c.entries = append(c.entries[:i], c.entries[i+1:]...)
+			}
 			continue
+
+		case remove := <-c.remove:
+			c.entries = append(c.entries[:remove], c.entries[remove+1:]...)
 
 		case newEntry := <-c.add:
 			c.entries = append(c.entries, newEntry)
@@ -361,11 +375,12 @@ func (c *Cron) entrySnapshot() []*Entry {
 // Stores all *preset* schedules to a JSON file. All other jobs (simple functions)
 // can't  be stored. Parameters are stored as well using the standard JSON marshaller.
 // All standard marshaller rules apply (private fields etc.)
-func (c *Cron) PersistToWriter(writer io.Writer) (error) {
+func (c *Cron) PersistToWriter(writer io.Writer) error {
 	entries := []*Entry{}
 	for _, entry := range c.entrySnapshot() {
 		switch entry.Job.(type) {
-		case PresetJob:  entries = append(entries, entry)
+		case PresetJob:
+			entries = append(entries, entry)
 		}
 	}
 
@@ -374,8 +389,8 @@ func (c *Cron) PersistToWriter(writer io.Writer) (error) {
 		Running  bool
 		Location *time.Location
 	}{
-		Entries: entries,
-		Running: c.running,
+		Entries:  entries,
+		Running:  c.running,
 		Location: c.location,
 	}
 	marshalled, err := json.Marshal(data)
@@ -446,9 +461,9 @@ func parseJob(cron *Cron, unparsedJob interface{}) (Job, error) {
 			parameters = jobData["Parameters"].([]interface{})
 		}
 		return PresetJob{
-			cron: cron,
-			Parameters:  parameters,
-			JobName: jobData["ScheduledJob"].(string),
+			cron:       cron,
+			Parameters: parameters,
+			JobName:    jobData["ScheduledJob"].(string),
 		}, nil
 	default:
 		return nil, errors.New("Unknow or empty Job category: " + jobData["Cat"].(string))
@@ -474,11 +489,11 @@ func parseSchedule(unparsedSchedule interface{}) (Schedule, error) {
 		hour, _ := strconv.ParseUint(scheduleData["Hour"].(string), 10, 64)
 		month, _ := strconv.ParseUint(scheduleData["Month"].(string), 10, 64)
 		return &SpecSchedule{
-			Dom: dom,
-			Dow: dow,
-			Hour: hour,
+			Dom:    dom,
+			Dow:    dow,
+			Hour:   hour,
 			Minute: minute,
-			Month: month,
+			Month:  month,
 			Second: second,
 		}, nil
 	default:
@@ -509,6 +524,6 @@ func (c *Cron) RemoveIndex(index string) {
 	}
 	for _, i := range entriesToRemove {
 		c.entries = append(c.entries[:i], c.entries[i+1:]...)
-	}	
+	}
 	c.Start()
 }
